@@ -32,8 +32,9 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QPoint
+from PySide6.QtCore import Qt, Signal, QSize, QPoint, QThread, QByteArray, QBuffer, QIODevice
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtMultimedia import QMediaDevices, QAudioSource, QAudioFormat
 
 from theme import get_palette
 from storage import StorageManager
@@ -549,6 +550,39 @@ class MessageCardWidget(QFrame):
         self.card_layout.addWidget(DraftPreviewCard(draft_card, theme_mode=self.theme_mode))
 
 
+class SpeechTranscribeWorker(QThread):
+    """
+    Background worker that converts recorded 16kHz 16-bit mono PCM audio bytes
+    into Korean/English text using `speech_recognition` (Google STT).
+    """
+    transcribed = Signal(bool, str)  # (ok, text_or_error)
+
+    def __init__(self, raw_pcm_bytes: bytes, sample_rate: int = 16000, parent=None):
+        super().__init__(parent)
+        self.raw_pcm = raw_pcm_bytes
+        self.sample_rate = sample_rate
+
+    def run(self):
+        if not self.raw_pcm or len(self.raw_pcm) < 800:
+            self.transcribed.emit(False, "녹음된 음성이 너무 짧습니다. 다시 말씀해 주세요.")
+            return
+        try:
+            import speech_recognition as sr
+            recognizer = sr.Recognizer()
+            audio_data = sr.AudioData(self.raw_pcm, self.sample_rate, 2)
+            try:
+                text = recognizer.recognize_google(audio_data, language="ko-KR")
+            except sr.UnknownValueError:
+                text = recognizer.recognize_google(audio_data, language="en-US")
+            self.transcribed.emit(True, text.strip())
+        except Exception as e:
+            err_name = type(e).__name__
+            if "UnknownValueError" in err_name:
+                self.transcribed.emit(False, "음성을 인식하지 못했습니다. 마이크 가까이에서 말씀해 주세요.")
+            else:
+                self.transcribed.emit(False, f"음성 인식 오류: {e}")
+
+
 class ComposerTextEdit(QPlainTextEdit):
     """Multi-line composer that submits on Enter (without Shift)."""
     submitted = Signal()
@@ -594,6 +628,11 @@ class BsideAgentSidepanel(QWidget):
         self.active_page_url = "bside://newtab"
         self.streaming_card: Optional[MessageCardWidget] = None
         self.remote_btns: List[QPushButton] = []
+        self._is_recording = False
+        self._audio_source: Optional[QAudioSource] = None
+        self._audio_buffer: Optional[QBuffer] = None
+        self._audio_bytes = QByteArray()
+        self._stt_worker: Optional[SpeechTranscribeWorker] = None
 
         self.setMinimumWidth(355)
         self.setMaximumWidth(560)
@@ -743,9 +782,10 @@ class BsideAgentSidepanel(QWidget):
         self.composer_input.setPlaceholderText("Ask AI a task, @ for context (이 페이지 분석·작성·원격 제어)")
         self.composer_input.setFixedHeight(48)
         self.composer_input.submitted.connect(self._submit)
+        self.composer_input.textChanged.connect(self._update_send_mic_button_ui)
         comp_layout.addWidget(self.composer_input)
 
-        # 3-D. Bottom Row inside Composer Card: Circular `+` on left, Circular Dark button on right (Image 3)
+        # 3-D. Bottom Row inside Composer Card: Circular `+` on left, Circular Dark Mic/Enter button on right
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 2, 0, 0)
         action_row.setSpacing(8)
@@ -764,8 +804,8 @@ class BsideAgentSidepanel(QWidget):
         self.send_btn.setFixedSize(36, 36)
         self.send_btn.setIconSize(QSize(18, 18))
         self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.send_btn.setToolTip("전송 (Enter)")
-        self.send_btn.clicked.connect(self._submit)
+        self.send_btn.setToolTip("🎤 음성 입력 (클릭하고 말하면 입력란에 텍스트가 자동 입력됩니다)")
+        self.send_btn.clicked.connect(self._on_send_or_mic_clicked)
         action_row.addWidget(self.send_btn)
 
         comp_layout.addLayout(action_row)
@@ -999,7 +1039,7 @@ class BsideAgentSidepanel(QWidget):
         self.new_chat_btn.setIcon(make_nav_icon("new_chat", p["fg"], p["accent"], 22))
         self.settings_btn.setIcon(make_nav_icon("settings", p["fg"], p["accent"], 22))
         self.attach_btn.setIcon(make_nav_icon("plus", p["fg_muted"], p["accent"], 20))
-        self.send_btn.setIcon(make_nav_icon("mic", p["primary_fg"], p["accent"], 20))
+        self._update_send_mic_button_ui()
 
         self._sync_perm_and_ctx_buttons()
         self.model_selector_btn.setIcon(make_provider_icon(self.current_model_id, size=18))
@@ -1237,7 +1277,157 @@ class BsideAgentSidepanel(QWidget):
         self.storage.create_session("새 대화")
         self.reload_active_session()
 
+    def _update_send_mic_button_ui(self):
+        """
+        Dynamically updates the right-hand circular button (`self.send_btn`):
+        - Recording state (`self._is_recording == True`): Red circle with Stop (`■`) icon
+        - Empty input state: Dark circle with Microphone (`🎤`) icon -> clicking starts voice dictation!
+        - Text entered state: Dark/Accent circle with Enter (`↵`) icon -> clicking submits the text!
+        """
+        theme_mode = self.storage.get_setting("theme", "light")
+        p = get_palette(theme_mode)
+        has_text = bool(self.composer_input.toPlainText().strip())
+
+        if self._is_recording:
+            self.send_btn.setIcon(make_nav_icon("stop", "#FFFFFF", "#EF4444", 20))
+            self.send_btn.setToolTip("🔴 음성 녹음 중... 클릭하면 녹음을 마치고 텍스트로 입력합니다")
+            self.send_btn.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #EF4444;
+                    border: none;
+                    border-radius: 18px;
+                }
+                QPushButton:hover {
+                    background-color: #DC2626;
+                }
+                """
+            )
+        elif has_text:
+            self.send_btn.setIcon(make_nav_icon("enter", p["primary_fg"], p["accent"], 20))
+            self.send_btn.setToolTip("전송 (Enter) — 클릭하면 입력한 내용을 전송합니다")
+            self.send_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {p['primary']};
+                    border: none;
+                    border-radius: 18px;
+                }}
+                QPushButton:hover {{
+                    background-color: {p['accent']};
+                }}
+                QPushButton:disabled {{
+                    background-color: {p['border_strong']};
+                }}
+                """
+            )
+        else:
+            self.send_btn.setIcon(make_nav_icon("mic", p["primary_fg"], p["accent"], 20))
+            self.send_btn.setToolTip("🎤 음성으로 말해서 입력하기 (클릭 후 말씀하세요)")
+            self.send_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {p['primary']};
+                    border: none;
+                    border-radius: 18px;
+                }}
+                QPushButton:hover {{
+                    background-color: {p['accent']};
+                }}
+                QPushButton:disabled {{
+                    background-color: {p['border_strong']};
+                }}
+                """
+            )
+
+    def _on_send_or_mic_clicked(self):
+        if self._is_recording:
+            self._stop_voice_recording()
+            return
+        text = self.composer_input.toPlainText().strip()
+        if text:
+            self._submit()
+        else:
+            self._start_voice_recording()
+
+    def _start_voice_recording(self):
+        try:
+            dev = QMediaDevices.defaultAudioInput()
+            if dev.isNull():
+                self.status_label.setVisible(True)
+                self.status_label.setStyleSheet("font-size: 11px; color: #EF4444; font-weight: 700;")
+                self.status_label.setText("⚠️ 연결된 마이크 장치를 찾을 수 없습니다.")
+                return
+
+            fmt = QAudioFormat()
+            fmt.setSampleRate(16000)
+            fmt.setChannelCount(1)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+
+            self._audio_bytes = QByteArray()
+            self._audio_buffer = QBuffer(self._audio_bytes, self)
+            self._audio_buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+
+            self._audio_source = QAudioSource(dev, fmt, self)
+            self._audio_source.start(self._audio_buffer)
+            self._is_recording = True
+
+            self.status_label.setVisible(True)
+            self.status_label.setStyleSheet("font-size: 11.5px; color: #EF4444; font-weight: 700;")
+            self.status_label.setText("🎙️ 듣고 있습니다... 말씀하신 뒤 빨간 정지(■) 버튼을 눌러주세요.")
+            self._update_send_mic_button_ui()
+        except Exception as e:
+            self._is_recording = False
+            self.status_label.setVisible(True)
+            self.status_label.setStyleSheet("font-size: 11px; color: #EF4444; font-weight: 700;")
+            self.status_label.setText(f"⚠️ 마이크 시작 오류: {e}")
+            self._update_send_mic_button_ui()
+
+    def _stop_voice_recording(self):
+        self._is_recording = False
+        raw_bytes = b""
+        try:
+            if self._audio_source is not None:
+                self._audio_source.stop()
+                self._audio_source.deleteLater()
+                self._audio_source = None
+            if self._audio_buffer is not None:
+                self._audio_buffer.close()
+                raw_bytes = bytes(self._audio_bytes)
+                self._audio_buffer.deleteLater()
+                self._audio_buffer = None
+        except Exception:
+            pass
+
+        self._update_send_mic_button_ui()
+        self.status_label.setVisible(True)
+        self.status_label.setStyleSheet("font-size: 11.5px; color: #4F46E5; font-weight: 700;")
+        self.status_label.setText("⏳ 음성을 텍스트로 변환 중...")
+
+        self._stt_worker = SpeechTranscribeWorker(raw_bytes, sample_rate=16000, parent=self)
+        self._stt_worker.transcribed.connect(self._on_speech_transcribed)
+        self._stt_worker.start()
+
+    def _on_speech_transcribed(self, ok: bool, result_text: str):
+        if ok and result_text:
+            cur_text = self.composer_input.toPlainText().strip()
+            new_text = f"{cur_text} {result_text}".strip() if cur_text else result_text
+            self.composer_input.setPlainText(new_text)
+            self.composer_input.setFocus()
+            cursor = self.composer_input.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.composer_input.setTextCursor(cursor)
+            self.status_label.setStyleSheet("font-size: 11.5px; color: #10B981; font-weight: 700;")
+            self.status_label.setText(f"✓ 음성 입력 완료: \"{result_text}\" (Enter 또는 ↵ 버튼으로 전송)")
+        else:
+            self.status_label.setStyleSheet("font-size: 11.5px; color: #EF4444; font-weight: 600;")
+            self.status_label.setText(f"⚠️ {result_text}")
+        self._update_send_mic_button_ui()
+
     def _submit(self):
+        if self._is_recording:
+            self._stop_voice_recording()
+            return
         text = self.composer_input.toPlainText().strip()
         if not text:
             return
@@ -1245,4 +1435,5 @@ class BsideAgentSidepanel(QWidget):
         self.composer_input.clear()
         self.attachments.clear()
         self.attachment_label.setVisible(False)
+        self._update_send_mic_button_ui()
         self.prompt_submitted.emit(text, atts)

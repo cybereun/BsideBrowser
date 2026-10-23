@@ -567,6 +567,26 @@ def make_nav_icon(
             p.drawArc(arc_r, 180 * 16, 180 * 16)
             p.drawLine(QPointF(c, size * 0.66 + dy), QPointF(c, size * 0.78 + dy))
 
+        elif kind == "enter":
+            # Crisp Enter / Return key icon (↵)
+            path = QPainterPath()
+            path.moveTo(size * 0.72, size * 0.28 + dy)
+            path.lineTo(size * 0.72, size * 0.56 + dy)
+            path.lineTo(size * 0.28, size * 0.56 + dy)
+            p.drawPath(path)
+            arr = QPainterPath()
+            arr.moveTo(size * 0.44, size * 0.40 + dy)
+            arr.lineTo(size * 0.26, size * 0.56 + dy)
+            arr.lineTo(size * 0.44, size * 0.72 + dy)
+            p.drawPath(arr)
+
+        elif kind == "stop":
+            # Recording stop square icon
+            p.setBrush(QBrush(pen_color))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QRectF(size * 0.32, size * 0.32 + dy, size * 0.36, size * 0.36), 3.0, 3.0)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+
     # 1. Soft 3D drop shadow
     draw_shape(shadow, dy=1.0)
     # 2. Foreground crisp stroke
@@ -574,3 +594,69 @@ def make_nav_icon(
 
     p.end()
     return QIcon(pix)
+
+
+def make_pushpin_icon(pinned: bool = False, size: int = 20) -> QIcon:
+    """
+    Renders the Chrome Extension Pushpin (압핀) icon matching Image 1:
+    - When `pinned=True`: Solid/active blue-indigo or charcoal pushpin (고정됨 -> 툴바에 아이콘 표시)
+    - When `pinned=False`: Outline pushpin with diagonal slash in magenta/rose (`#E11D48` / `#EC4899`)
+      matching Image 1's crossed-out pushpin icon!
+    """
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    color = QColor("#2563EB") if pinned else QColor("#DB2777")
+    pen = QPen(color, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+
+    # Top horizontal bar of pushpin
+    p.drawLine(QPointF(size * 0.30, size * 0.22), QPointF(size * 0.70, size * 0.22))
+
+    # Body of pushpin tapering down to a wider flange
+    body = QPainterPath()
+    body.moveTo(size * 0.36, size * 0.22)
+    body.lineTo(size * 0.36, size * 0.44)
+    body.lineTo(size * 0.26, size * 0.56)
+    body.lineTo(size * 0.74, size * 0.56)
+    body.lineTo(size * 0.64, size * 0.44)
+    body.lineTo(size * 0.64, size * 0.22)
+    body.closeSubpath()
+
+    if pinned:
+        p.setBrush(QBrush(QColor(37, 99, 235, 65)))
+    else:
+        p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(body)
+
+    # Bottom needle point
+    p.drawLine(QPointF(size * 0.50, size * 0.56), QPointF(size * 0.50, size * 0.82))
+
+    # Diagonal slash when unpinned (exactly like Image 1's pink crossed-out pin)
+    if not pinned:
+        slash_pen = QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(slash_pen)
+        p.drawLine(QPointF(size * 0.20, size * 0.20), QPointF(size * 0.80, size * 0.80))
+
+    p.end()
+    return QIcon(pix)
+
+
+def make_more_dots_icon(fg_hex: str = "#52525B", size: int = 20) -> QIcon:
+    """Renders the vertical 3-dots (`⋮`) menu icon matching Image 1."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(fg_hex))
+    cx = size * 0.5
+    r = max(1.5, size * 0.08)
+    for ry in (0.26, 0.50, 0.74):
+        p.drawEllipse(QPointF(cx, size * ry), r, r)
+    p.end()
+    return QIcon(pix)
+

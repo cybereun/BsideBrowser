@@ -6,7 +6,7 @@ Minimalist, cozy & tactile 3D aesthetic (matches reference screenshots: warm ivo
 
 from version import APP_NAME, APP_VERSION
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.0.1"
 
 DARK_PALETTE = {
     "name": "dark",

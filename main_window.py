@@ -45,7 +45,13 @@ from agent_engine import (
     AgentWorker,
 )
 from dialogs import TabSearchDialog, BsideVaultDialog, SettingsWorkspaceDialog
-from extensions import ChromeExtensionManagerDialog, ExtensionActionPopup
+from extensions import (
+    ChromeExtensionManagerDialog,
+    ExtensionActionPopup,
+    ExtensionToolbarPopover,
+    get_extension_meta_and_icon,
+    is_internal_builtin_extension,
+)
 from updater import AutoUpdater
 
 
@@ -400,7 +406,7 @@ class MainWindow(QMainWindow):
 
         nav_layout.addWidget(self.omnibox_frame, 1)
 
-        # Right-hand Toolbar Icons matching uploaded reference image: Key (Vault) -> Puzzle (Chrome Extensions) -> Sidebar Toggle
+        # Right-hand Toolbar: Vault Key -> Toolbar Extension Pins Container (Image 3) -> Puzzle Icon (Image 2) -> Sidebar Toggle
         self.vault_nav_btn = QPushButton()
         self.vault_nav_btn.setFixedSize(36, 36)
         self.vault_nav_btn.setIconSize(QSize(22, 22))
@@ -410,13 +416,25 @@ class MainWindow(QMainWindow):
         self.vault_nav_btn.clicked.connect(self.open_vault_dialog)
         nav_layout.addWidget(self.vault_nav_btn)
 
+        # Thin divider between Vault and Pinned Extensions matching Image 3 (`[🔑]  |  [Ext1] [Ext2] [🧩]`)
+        self.ext_div_lbl = QLabel("|")
+        self.ext_div_lbl.setStyleSheet("color: #D4D4D8; font-size: 15px; margin: 0px 2px;")
+        nav_layout.addWidget(self.ext_div_lbl)
+
+        # Dynamic container for pinned extension icons (Image 3)
+        self.pinned_ext_container = QWidget()
+        self.pinned_ext_layout = QHBoxLayout(self.pinned_ext_container)
+        self.pinned_ext_layout.setContentsMargins(0, 0, 0, 0)
+        self.pinned_ext_layout.setSpacing(4)
+        nav_layout.addWidget(self.pinned_ext_container)
+
         self.extensions_btn = QPushButton()
         self.extensions_btn.setFixedSize(36, 36)
         self.extensions_btn.setIconSize(QSize(22, 22))
         self.extensions_btn.setProperty("class", "NavIconBtn")
-        self.extensions_btn.setToolTip("🧩 크롬 확장 프로그램 설치 및 관리")
+        self.extensions_btn.setToolTip("🧩 크롬 확장 프로그램 (클릭하여 확장앱 목록 및 고정 관리)")
         self.extensions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.extensions_btn.clicked.connect(self.open_extensions_dialog)
+        self.extensions_btn.clicked.connect(self.open_extensions_popover)
         nav_layout.addWidget(self.extensions_btn)
 
         self.sidebar_toggle_btn = QPushButton()
@@ -739,12 +757,25 @@ class MainWindow(QMainWindow):
         js = build_vault_card_autofill_js(card)
         cur.webview.page().runJavaScript(js)
 
-    def open_extensions_dialog(self):
+    def open_extensions_popover(self):
+        """Opens the Chrome-style Extensions Dropdown Popover (Image 1) right below the puzzle button."""
+        pop = ExtensionToolbarPopover(self, parent=self)
+        btn_pos = self.extensions_btn.mapToGlobal(self.extensions_btn.rect().bottomRight())
+        pop_x = max(20, btn_pos.x() - 340)
+        pop_y = btn_pos.y() + 6
+        pop.move(QPoint(pop_x, pop_y))
+        pop.exec()
+
+    def open_extensions_manager_dialog(self):
+        """Opens the full Chrome Extension Manager & Installer Hub dialog."""
         dlg = ChromeExtensionManagerDialog(self, parent=self)
         dlg.open_url_requested.connect(self.add_new_tab)
         dlg.extensions_changed.connect(self.refresh_extension_pins)
         dlg.exec()
         self.refresh_extension_pins()
+
+    def open_extensions_dialog(self):
+        self.open_extensions_popover()
 
     def _load_saved_extensions(self):
         import os
@@ -769,19 +800,136 @@ class MainWindow(QMainWindow):
         self.refresh_extension_pins()
 
     def refresh_extension_pins(self):
-        # Do not clutter the toolbar with purple C / G letter badges;
-        # all extensions are cleanly accessed via the puzzle icon button (`self.extensions_btn`).
-        pass
+        """
+        Renders the active pinned extensions on the navigation toolbar directly to the left of the
+        Puzzle Icon (`🧩`) with their REAL manifest.json icons (Image 3)!
+        Clicking any pinned icon runs its popup or injects/triggers its content script on the page!
+        """
+        if not hasattr(self, "pinned_ext_layout"):
+            return
+
+        while self.pinned_ext_layout.count():
+            item = self.pinned_ext_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        pinned_paths = [
+            os.path.normpath(x) for x in self.storage.get_setting("pinned_extension_paths", []) if x
+        ]
+
+        user_exts = [
+            e for e in self.ext_mgr.extensions() if not is_internal_builtin_extension(e)
+        ]
+
+        count = 0
+        for ext in user_exts:
+            meta = get_extension_meta_and_icon(ext, icon_size=20)
+            norm_p = meta["path"]
+            if norm_p not in pinned_paths:
+                continue
+
+            count += 1
+            btn = QPushButton()
+            btn.setFixedSize(34, 34)
+            btn.setIcon(meta["icon"])
+            btn.setIconSize(QSize(20, 20))
+            btn.setProperty("class", "NavIconBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            disp_name = meta["display_name"]
+            btn.setToolTip(f"{disp_name} (클릭하여 실행)")
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: transparent;
+                    border: 1px solid transparent;
+                    border-radius: 9px;
+                    padding: 4px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(0, 0, 0, 0.06);
+                    border: 1px solid rgba(0, 0, 0, 0.12);
+                }
+                """
+            )
+            btn.clicked.connect(lambda checked=False, e=ext, b=btn: self.trigger_extension_from_toolbar(e, b))
+            self.pinned_ext_layout.addWidget(btn)
+
+        # Show or hide the divider based on whether any pinned icons exist
+        if hasattr(self, "ext_div_lbl"):
+            self.ext_div_lbl.setVisible(count > 0)
+
+    def trigger_extension_from_toolbar(self, ext, anchor_btn: Optional[QPushButton] = None):
+        """
+        Executes a Chrome extension when clicked from the toolbar (Image 3) or Popover (Image 1):
+        1. If it has an actionPopupUrl (HTML popup), opens `ExtensionActionPopup` right beneath the button.
+        2. If fallback options/popup URL was found in manifest.json, opens it.
+        3. If it has content scripts, injects them into the active web page and notifies the user with a sleek toast!
+        """
+        meta = get_extension_meta_and_icon(ext, icon_size=22)
+        popup_url = ext.actionPopupUrl()
+        if not popup_url or popup_url.isEmpty():
+            popup_url = meta.get("fallback_popup_url")
+
+        if popup_url and not popup_url.isEmpty():
+            pop = ExtensionActionPopup(meta["display_name"], popup_url, self.web_profile, self)
+            ref_btn = anchor_btn or self.extensions_btn
+            global_pos = ref_btn.mapToGlobal(ref_btn.rect().bottomRight())
+            pop_x = max(20, global_pos.x() - 360)
+            pop_y = global_pos.y() + 6
+            pop.move(QPoint(pop_x, pop_y))
+            pop.exec()
+            return
+
+        # If extension has content scripts (e.g., Unblock Pro, BlogBox, Clipper), execute on active tab
+        cur = self.current_tab()
+        disp_name = meta["display_name"]
+        content_scripts = meta.get("content_scripts", [])
+        ext_dir = meta.get("path", "")
+
+        injected_count = 0
+        if cur and cur.webview and ext_dir and content_scripts:
+            for cs in content_scripts:
+                js_files = cs.get("js", [])
+                for rel_js in js_files:
+                    full_js = os.path.join(ext_dir, rel_js.lstrip("/\\"))
+                    if os.path.isfile(full_js):
+                        try:
+                            with open(full_js, "r", encoding="utf-8", errors="ignore") as f:
+                                code = f.read()
+                            cur.webview.page().runJavaScript(code)
+                            injected_count += 1
+                        except Exception:
+                            pass
+
+        if cur and cur.webview:
+            # Show a cute non-blocking on-page toast in the browser
+            toast_text = f"🧩 {disp_name} 확장 프로그램 실행됨"
+            toast_sub = "현재 페이지에 정상 적용되었습니다." if injected_count > 0 else "백그라운드에서 활성 작동 중입니다."
+            toast_js = f"""
+            (function() {{
+                let existing = document.getElementById('bside-ext-toast');
+                if (existing) existing.remove();
+                let toast = document.createElement('div');
+                toast.id = 'bside-ext-toast';
+                toast.innerHTML = '<b style="font-size:13px;display:block;">{toast_text}</b><span style="font-size:11.5px;color:#94A3B8;">{toast_sub}</span>';
+                toast.style.cssText = 'position:fixed;top:16px;right:16px;z-index:9999999;background:#1E1E22;color:#FFF;padding:10px 16px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.3);font-family:sans-serif;pointer-events:none;transition:opacity 0.4s;opacity:1;';
+                document.body.appendChild(toast);
+                setTimeout(function() {{
+                    toast.style.opacity = '0';
+                    setTimeout(function() {{ if (toast.parentNode) toast.parentNode.removeChild(toast); }}, 500);
+                }}, 2500);
+            }})();
+            """
+            cur.webview.page().runJavaScript(toast_js)
+        else:
+            QMessageBox.information(
+                self,
+                "확장 프로그램 활성",
+                f"'{disp_name}' 확장 프로그램이 정상 로드되어 백그라운드에서 실행 중입니다.",
+            )
 
     def _trigger_extension_action(self, ext, btn: QPushButton):
-        popup_url = ext.actionPopupUrl()
-        if popup_url and not popup_url.isEmpty():
-            pop = ExtensionActionPopup(ext.name(), popup_url, self.web_profile, self)
-            global_pos = btn.mapToGlobal(btn.rect().bottomLeft())
-            pop.move(global_pos.x() - 300, global_pos.y() + 6)
-            pop.exec()
-        else:
-            self.open_extensions_dialog()
+        self.trigger_extension_from_toolbar(ext, btn)
 
     def open_settings_dialog(self):
         dlg = SettingsWorkspaceDialog(self.storage, parent=self)
