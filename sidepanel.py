@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QPoint, QThread, QByteArray, QBuffer, QIODevice
+from PySide6.QtCore import Qt, Signal, QSize, QPoint, QThread, QByteArray, QBuffer, QIODevice, QTimer
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtMultimedia import QMediaDevices, QAudioSource, QAudioFormat
 
@@ -701,6 +701,13 @@ class BsideAgentSidepanel(QWidget):
         self.scroll_area.setWidget(self.messages_container)
         root.addWidget(self.scroll_area, 1)
 
+        # The newest question stays pinned at the top of the view while its answer streams in below it.
+        self._anchor_card = None
+        self._user_scrolled = False
+        self.scroll_area.verticalScrollBar().actionTriggered.connect(
+            lambda _action: setattr(self, "_user_scrolled", True)  # only user input triggers this, not setValue()
+        )
+
         # Subtle Live Status Line
         self.status_label = QLabel("")
         self.status_label.setVisible(False)
@@ -1222,13 +1229,19 @@ class BsideAgentSidepanel(QWidget):
             card = MessageCardWidget(msg, theme_mode=theme_mode)
             self.messages_layout.insertWidget(self.messages_layout.count() - 1, card)
 
+        self._anchor_card = None
         self._scroll_to_bottom()
 
     def append_message_card(self, msg: Dict[str, Any]) -> MessageCardWidget:
         theme_mode = self.storage.get_setting("theme", "light")
         card = MessageCardWidget(msg, theme_mode=theme_mode)
         self.messages_layout.insertWidget(self.messages_layout.count() - 1, card)
-        self._scroll_to_bottom()
+        if msg.get("role") == "user":
+            self._anchor_card = card
+            self._user_scrolled = False
+            self._apply_anchor()
+        else:
+            self._apply_anchor() if self._anchor_card is not None else self._scroll_to_bottom()
         return card
 
     def start_streaming_assistant_card(self):
@@ -1239,7 +1252,7 @@ class BsideAgentSidepanel(QWidget):
     def update_streaming_assistant_card(self, partial_text: str):
         if self.streaming_card is not None:
             self.streaming_card.update_streaming_text(partial_text)
-            self._scroll_to_bottom()
+            self._apply_anchor()
 
     def finalize_streaming_assistant_card(self, final_msg: Dict[str, Any]):
         if self.streaming_card is not None:
@@ -1249,7 +1262,7 @@ class BsideAgentSidepanel(QWidget):
             if final_msg.get("draft_card"):
                 self.streaming_card.add_draft_card(final_msg["draft_card"])
             self.streaming_card = None
-            self._scroll_to_bottom()
+            self._apply_anchor()
         else:
             self.append_message_card(final_msg)
 
@@ -1259,9 +1272,29 @@ class BsideAgentSidepanel(QWidget):
         self.status_label.setText(text)
         self.send_btn.setEnabled(not busy)
 
+    def _apply_anchor(self):
+        """Scrolls so the latest question sits at the top of the view (unless the user scrolled on their own)."""
+        if self._anchor_card is None or self._user_scrolled:
+            return
+
+        def go():
+            card = self._anchor_card
+            if card is None or self._user_scrolled:
+                return
+            top = card.mapTo(self.messages_container, QPoint(0, 0)).y()
+            self.scroll_area.verticalScrollBar().setValue(max(0, top - 6))
+
+        # The layout has not been recomputed yet when a card is added; apply once it has.
+        QTimer.singleShot(0, go)
+        QTimer.singleShot(60, go)
+
     def _scroll_to_bottom(self):
-        bar = self.scroll_area.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        def go():
+            bar = self.scroll_area.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+        QTimer.singleShot(0, go)
+        QTimer.singleShot(60, go)
 
     def _attach_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "첨부할 파일 선택")

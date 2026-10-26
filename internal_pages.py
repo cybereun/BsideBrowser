@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPoint, QTimer
 
 from theme import get_palette
 from icons import make_3d_badge_pixmap, get_internal_title_icon_pixmap
@@ -263,12 +263,14 @@ class NewTabWidget(QWidget):
             {"role": "assistant", "content": "✦ 생각 중..."}, theme_mode=theme_mode
         )
         self.inline_results_layout.addWidget(self.inline_streaming_card)
-        self._scroll_to_bottom()
+        self._inline_anchor = user_card
+        self._inline_user_scrolled = False
+        self._apply_inline_anchor()
 
     def update_inline_streaming(self, partial_text: str):
         if self.inline_streaming_card is not None:
             self.inline_streaming_card.update_streaming_text(partial_text)
-            self._scroll_to_bottom()
+            self._apply_inline_anchor()
 
     def finalize_inline_turn(self, final_msg: Dict[str, Any]):
         if self.inline_streaming_card is not None:
@@ -278,7 +280,7 @@ class NewTabWidget(QWidget):
             if final_msg.get("draft_card"):
                 self.inline_streaming_card.add_draft_card(final_msg["draft_card"])
             self.inline_streaming_card = None
-            self._scroll_to_bottom()
+            self._apply_inline_anchor()
 
     def set_inline_status(self, text: str, busy: bool = False):
         self.inline_status_lbl.setVisible(busy)
@@ -286,6 +288,7 @@ class NewTabWidget(QWidget):
         self.submit_btn.setEnabled(not busy)
 
     def clear_inline_results(self):
+        self._inline_anchor = None
         self.inline_streaming_card = None
         while self.inline_results_layout.count():
             item = self.inline_results_layout.takeAt(0)
@@ -293,6 +296,26 @@ class NewTabWidget(QWidget):
                 item.widget().deleteLater()
         self.inline_results_frame.setVisible(False)
         self.clear_inline_btn.setVisible(False)
+
+    def _apply_inline_anchor(self):
+        """Keeps the newest question at the top of the view while its answer streams in below."""
+        if getattr(self, "_inline_anchor", None) is None or getattr(self, "_inline_user_scrolled", False):
+            return
+        if not getattr(self, "_inline_scroll_hooked", False):
+            self.scroll.verticalScrollBar().actionTriggered.connect(
+                lambda _a: setattr(self, "_inline_user_scrolled", True)
+            )
+            self._inline_scroll_hooked = True
+
+        def go():
+            card = self._inline_anchor
+            if card is None or self._inline_user_scrolled:
+                return
+            top = card.mapTo(self.stage_widget, QPoint(0, 0)).y()
+            self.scroll.verticalScrollBar().setValue(max(0, top - 8))
+
+        QTimer.singleShot(0, go)
+        QTimer.singleShot(60, go)
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()

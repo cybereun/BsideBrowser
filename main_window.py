@@ -8,6 +8,7 @@ Minimalist, cozy & tactile 3D UI:
 - Real-time AI streaming + Direct Remote Page Control (`_execute_bsidewright_action`)
 """
 
+import base64
 import json
 import urllib.parse
 from typing import Dict, Any, List, Optional
@@ -26,9 +27,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QMessageBox,
     QToolTip,
+    QMenu,
 )
-from PySide6.QtCore import Qt, QUrl, Signal, QSize, QEvent, QObject, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QKeyEvent
+from PySide6.QtCore import Qt, QUrl, Signal, QSize, QEvent, QObject, QTimer, QBuffer, QIODevice, QByteArray
+from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QKeyEvent, QIcon, QPixmap
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile
 
@@ -56,6 +58,104 @@ from extensions import (
     is_internal_builtin_extension,
 )
 from updater import AutoUpdater
+
+
+class BookmarksBar(QWidget):
+    """Chrome-style bookmarks bar: one chip per saved bookmark, extra ones fold into a » menu."""
+    open_requested = Signal(str, bool)   # url, open in a new tab
+    remove_requested = Signal(str)       # bookmark id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BookmarksBar")
+        self.setFixedHeight(34)
+        self._items: List[Dict[str, Any]] = []
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(10, 3, 10, 3)
+        self._layout.setSpacing(2)
+
+    def set_bookmarks(self, items: List[Dict[str, Any]]) -> None:
+        self._items = list(items)
+        self._rebuild()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rebuild()
+
+    def _clear(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    @staticmethod
+    def _label(bm: Dict[str, Any]) -> str:
+        title = (bm.get("title") or bm.get("url") or "").strip()
+        return title if len(title) <= 18 else title[:17] + "…"
+
+    def _make_chip(self, bm: Dict[str, Any]) -> QPushButton:
+        chip = QPushButton()
+        chip.setProperty("class", "BookmarkChip")
+        chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        chip.setToolTip(f"{bm.get('title', '')}\n{bm.get('url', '')}")
+        fav = bm.get("favicon")
+        if fav:
+            pm = QPixmap()
+            pm.loadFromData(QByteArray(base64.b64decode(fav)), "PNG")
+            chip.setIcon(QIcon(pm))
+            chip.setText(self._label(bm))
+        else:
+            chip.setText(f"{bm.get('icon', '★')} {self._label(bm)}")
+        chip.clicked.connect(
+            lambda _=False, b=bm: self.open_requested.emit(
+                b["url"], bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
+            )
+        )
+        chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        chip.customContextMenuRequested.connect(lambda pos, b=bm, c=chip: self._context_menu(b, c.mapToGlobal(pos)))
+        return chip
+
+    def _context_menu(self, bm: Dict[str, Any], global_pos) -> None:
+        menu = QMenu(self)
+        menu.addAction("열기").triggered.connect(lambda: self.open_requested.emit(bm["url"], False))
+        menu.addAction("새 탭에서 열기").triggered.connect(lambda: self.open_requested.emit(bm["url"], True))
+        menu.addSeparator()
+        menu.addAction("북마크 삭제").triggered.connect(lambda: self.remove_requested.emit(bm["id"]))
+        menu.exec(global_pos)
+
+    def _rebuild(self) -> None:
+        self._clear()
+        if not self._items:
+            hint = QLabel("☆ 북마크가 없습니다 — 주소창의 별(★)을 누르거나 Ctrl+D 로 현재 페이지를 추가하세요")
+            hint.setStyleSheet("font-size: 12px; color: gray; padding-left: 4px;")
+            self._layout.addWidget(hint)
+            self._layout.addStretch(1)
+            return
+
+        avail = self.width() - 20 - 40  # margins + room for the » button
+        used = 0
+        hidden: List[Dict[str, Any]] = []
+        for bm in self._items:
+            chip = self._make_chip(bm)
+            w = chip.sizeHint().width() + 2
+            if not hidden and used + w <= avail:
+                self._layout.addWidget(chip)
+                used += w
+            else:
+                chip.deleteLater()
+                hidden.append(bm)
+        self._layout.addStretch(1)
+        if hidden:
+            more = QPushButton("»")
+            more.setProperty("class", "BookmarkChip")
+            more.setCursor(Qt.CursorShape.PointingHandCursor)
+            more.setToolTip(f"북마크 {len(hidden)}개 더 보기")
+            menu = QMenu(more)
+            for bm in hidden:
+                act = menu.addAction(f"{bm.get('icon', '★')}  {self._label(bm)}")
+                act.triggered.connect(lambda _=False, b=bm: self.open_requested.emit(b["url"], False))
+            more.setMenu(menu)
+            self._layout.addWidget(more)
 
 
 class InstantTooltipFilter(QObject):
@@ -452,6 +552,13 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(self.nav_toolbar)
 
+        self.bookmarks_bar = BookmarksBar()
+        self.bookmarks_bar.open_requested.connect(self._open_bookmark)
+        self.bookmarks_bar.remove_requested.connect(self._remove_bookmark)
+        self.bookmarks_bar.setVisible(bool(self.storage.get_setting("show_bookmarks_bar", True)))
+        root_layout.addWidget(self.bookmarks_bar)
+        QTimer.singleShot(0, self.refresh_bookmarks_bar)
+
         # 3. Main Horizontal Splitter: Left Browser Viewport + Right Minimal AI Sidepanel
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.tab_stack = QStackedWidget()
@@ -481,11 +588,13 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_omnibox)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._reload_page)
         QShortcut(QKeySequence("Ctrl+D"), self, activated=self.toggle_current_bookmark)
+        QShortcut(QKeySequence("Ctrl+Shift+B"), self, activated=self._toggle_bookmarks_bar)
 
     def apply_theme(self):
         self.theme_mode = self.storage.get_setting("theme", "light")
         p = get_palette(self.theme_mode)
         QApplication.instance().setStyleSheet(get_app_stylesheet(self.theme_mode))
+        self.refresh_bookmarks_bar()
 
         # Apply crisp vector icons matching current theme
         self.new_tab_btn.setIcon(make_nav_icon("plus", p["fg"], p["accent"], 20))
@@ -675,7 +784,25 @@ class MainWindow(QMainWindow):
             self.navigate_current_tab(val)
 
     def refresh_bookmarks_bar(self):
-        pass
+        bar = getattr(self, "bookmarks_bar", None)
+        if bar is not None:
+            bar.set_bookmarks(self.storage.get_bookmarks())
+
+    def _toggle_bookmarks_bar(self):
+        show = not self.bookmarks_bar.isVisible()
+        self.bookmarks_bar.setVisible(show)
+        self.storage.set_setting("show_bookmarks_bar", show)
+        self.refresh_bookmarks_bar()
+
+    @staticmethod
+    def _favicon_b64(tab: "BrowserTab") -> str:
+        icon = tab.webview.icon()
+        if icon.isNull():
+            return ""
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        icon.pixmap(16, 16).save(buf, "PNG")
+        return base64.b64encode(bytes(buf.data())).decode("ascii")
 
     def toggle_current_bookmark(self):
         cur = self.current_tab()
@@ -684,9 +811,30 @@ class MainWindow(QMainWindow):
         url = cur.logical_url
         if self.storage.is_bookmarked(url):
             self.storage.remove_bookmark(url)
+            msg = "북마크에서 삭제했습니다"
         else:
-            self.storage.add_bookmark(cur.logical_title, url)
+            bm = self.storage.add_bookmark(cur.logical_title, url)
+            fav = self._favicon_b64(cur)
+            if fav:
+                bm["favicon"] = fav
+                self.storage.save()
+            msg = "★ 북마크 막대에 추가했습니다"
+        self.refresh_bookmarks_bar()
         self.on_tab_updated(cur)
+        QToolTip.showText(self.bookmark_star_btn.mapToGlobal(self.bookmark_star_btn.rect().bottomLeft()), msg, self.bookmark_star_btn)
+
+    def _open_bookmark(self, url: str, new_tab: bool):
+        if new_tab or not self.current_tab():
+            self.add_new_tab(url)
+        else:
+            self.navigate_current_tab(url)
+
+    def _remove_bookmark(self, bookmark_id: str):
+        self.storage.remove_bookmark(bookmark_id)
+        self.refresh_bookmarks_bar()
+        cur = self.current_tab()
+        if cur:
+            self.on_tab_updated(cur)
 
     # --- Internal Page Bridge (`bside://action/...`) ---
     def handle_internal_action(self, action: str, payload: Dict[str, Any]):
@@ -970,8 +1118,9 @@ class MainWindow(QMainWindow):
             sidepanel_open = True
 
         # Determine target display surface(s)
-        self._route_to_sidepanel = sidepanel_open or not on_newtab
-        self._route_to_newtab = (source == "newtab" and on_newtab and not sidepanel_open)
+        # Asked in the main new-tab box -> answer in the main window; otherwise (website open / sidepanel) -> sidepanel.
+        self._route_to_newtab = (source == "newtab" and on_newtab)
+        self._route_to_sidepanel = not self._route_to_newtab
         self._target_newtab_widget = cur.newtab_widget if (cur and on_newtab) else None
 
         if self._route_to_sidepanel and not sidepanel_open:
@@ -1021,7 +1170,7 @@ class MainWindow(QMainWindow):
             snapshot["url"] = cur.logical_url
             self._start_agent_worker(full_prompt, snapshot)
 
-        cur.webview.page().runJavaScript(BSIDEWRIGHT_SNAPSHOT_JS, on_dom_snapshot)
+        self._run_js_json(cur.webview.page(), BSIDEWRIGHT_SNAPSHOT_JS, on_dom_snapshot)
 
     def _start_agent_worker(self, prompt: str, snapshot: Dict[str, Any], autonomous: bool = False):
         open_tabs = [{"title": t.logical_title, "url": t.logical_url} for t in self.tabs]
@@ -1086,6 +1235,21 @@ class MainWindow(QMainWindow):
             if cards:
                 self._autofill_vault_card(cards[0])
 
+    @staticmethod
+    def _run_js_json(page, js: str, callback):
+        """
+        Runs a JS expression that returns an object and hands back the parsed dict (or None).
+        Qt hands object results to Python as an empty string, so the page serialises them to JSON.
+        """
+        def _done(raw):
+            try:
+                data = json.loads(raw) if isinstance(raw, str) and raw else None
+            except ValueError:
+                data = None
+            callback(data)
+
+        page.runJavaScript("JSON.stringify(" + js.strip().rstrip(";") + ")", _done)
+
     def _stop_remote_agent(self):
         worker = getattr(self, "active_worker", None)
         if isinstance(worker, AutonomousAgentWorker) and worker.isRunning():
@@ -1105,7 +1269,8 @@ class MainWindow(QMainWindow):
             return
 
         if op == "snapshot":
-            cur.webview.page().runJavaScript(
+            self._run_js_json(
+                cur.webview.page(),
                 AGENT_SNAPSHOT_JS,
                 lambda r: reply({"ok": isinstance(r, dict), "snapshot": r}),
             )

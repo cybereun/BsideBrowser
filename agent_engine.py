@@ -15,6 +15,7 @@ Supports explicit manual selection between:
    - `bside-autonomous-v1`: Instant offline DOM analyzer & remote controller
 """
 
+import glob
 import os
 import json
 import queue
@@ -22,6 +23,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -43,7 +45,12 @@ def get_subscription_auth_status() -> Dict[str, Dict[str, Any]]:
     claude_logged_in = os.path.exists(claude_cred) and os.path.getsize(claude_cred) > 10
 
     # 2. Codex CLI
-    codex_bin = os.path.join(npm_dir, "codex.cmd")
+    # Prefer the Codex desktop app's bundled codex.exe: it is newer than the npm package (new models such as
+    # gpt-6-luna are rejected by old CLIs) and, being a real .exe, receives multi-line prompts intact.
+    bundled = glob.glob(os.path.join(local_appdata, "OpenAI", "Codex", "bin", "*", "codex.exe"))
+    codex_bin = max(bundled, key=os.path.getmtime) if bundled else ""
+    if not codex_bin:
+        codex_bin = os.path.join(npm_dir, "codex.cmd")
     if not os.path.exists(codex_bin):
         codex_bin = shutil.which("codex.cmd") or shutil.which("codex") or ""
     codex_cred = os.path.join(home, ".codex", "auth.json")
@@ -140,18 +147,47 @@ def create_codex_account() -> Dict[str, Any]:
     return {"id": f"account{n}", "home": home}
 
 
+def _launch_codex_login_hidden(bin_path: str, home: Optional[str]) -> Tuple[bool, str]:
+    """
+    Runs `codex login` with no console window. Codex opens the browser's OAuth page itself and exits once the
+    login finishes (or after 5 minutes), so nothing is left on screen.
+    """
+    env = dict(os.environ)
+    if home:
+        os.makedirs(home, exist_ok=True)
+        env["CODEX_HOME"] = home
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(
+            [bin_path, "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=creationflags,
+        )
+    except Exception as e:
+        return False, str(e)
+
+    def _reap() -> None:
+        try:
+            proc.communicate(timeout=300)
+        except Exception:
+            proc.kill()
+
+    threading.Thread(target=_reap, daemon=True).start()
+    return True, "브라우저에서 ChatGPT 로그인을 완료해 주세요. 완료되면 이 창의 계정 카드가 자동으로 '연결됨'으로 바뀝니다."
+
+
 def launch_codex_account_login(home: str) -> Tuple[bool, str]:
-    """Opens `codex login` for one specific account folder (CODEX_HOME) in a command window."""
+    """Starts `codex login` (hidden) for one specific account folder (CODEX_HOME)."""
     codex = get_subscription_auth_status()["codex"]
     if not codex["installed"]:
         return False, "codex CLI가 설치되어 있지 않습니다."
-    os.makedirs(home, exist_ok=True)
-    cmdline = f'start "Bside - Codex Login" cmd /k "set "CODEX_HOME={home}"&& "{codex["bin"]}" login"'
-    try:
-        subprocess.Popen(cmdline, shell=True)
-        return True, "로그인 창을 열었습니다. 이 계정으로 사용할 ChatGPT 계정으로 브라우저 로그인을 완료해 주세요."
-    except Exception as e:
-        return False, str(e)
+    return _launch_codex_login_hidden(codex["bin"], home)
 
 
 def launch_subscription_login_terminal(provider: str) -> Tuple[bool, str]:
@@ -166,7 +202,7 @@ def launch_subscription_login_terminal(provider: str) -> Tuple[bool, str]:
 
     bin_path = info["bin"]
     if provider == "codex":
-        cmdline = f'start "Bside - Codex Subscription Login" cmd /k ""{bin_path}" login"'
+        return _launch_codex_login_hidden(bin_path, None)
     elif provider == "claude":
         cmdline = f'start "Bside - Claude Subscription Login" cmd /k ""{bin_path}""'
     elif provider == "antigravity":
@@ -933,7 +969,6 @@ class AgentWorker(QThread):
             cmd = [
                 bin_path,
                 "-p",
-                full_input,
                 "--model",
                 c_model,
                 "--output-format",
@@ -955,7 +990,8 @@ class AgentWorker(QThread):
                 codex_out_file,
                 "-c",
                 f'model_reasoning_effort="{cli_effort}"',
-                full_input,
+                *(["-m", str(self.settings["codex_model"])] if self.settings.get("codex_model") else []),
+                "-",
             ]
         elif provider == "antigravity":
             # Map friendly Antigravity / Gemini model names to agy.exe models
@@ -976,6 +1012,9 @@ class AgentWorker(QThread):
         else:
             cmd = [bin_path, "-p", full_input]
 
+        # claude.cmd / codex.cmd are batch wrappers that cut a multi-line argument at the first newline,
+        # so the model only saw the first line of the prompt. Send the prompt on stdin instead.
+        stdin_text = full_input if provider in ("claude", "codex") else None
         if provider == "codex":
             # Several ChatGPT accounts: try the preferred one first, fall through to the next on quota/auth errors.
             accounts = [acc for acc in get_codex_accounts(self.settings.get("codex_active_account")) if acc["logged_in"]]
@@ -984,7 +1023,7 @@ class AgentWorker(QThread):
             last_err = ""
             for acc in accounts:
                 env = dict(os.environ, CODEX_HOME=acc["home"])
-                ok, out, kind = self._run_cli_process(cmd, env, creationflags, codex_out_file)
+                ok, out, kind = self._run_cli_process(cmd, env, creationflags, codex_out_file, stdin_text)
                 if ok:
                     set_preferred_codex_account(acc["id"])
                     return True, out
@@ -992,7 +1031,7 @@ class AgentWorker(QThread):
                 if kind == "other":
                     break
             return False, last_err
-        ok, out, _ = self._run_cli_process(cmd, None, creationflags, None)
+        ok, out, _ = self._run_cli_process(cmd, None, creationflags, None, stdin_text)
         return ok, out
 
     # A real quota/rate-limit failure prints these on stderr with a non-zero exit code.
@@ -1003,12 +1042,12 @@ class AgentWorker(QThread):
     )
     _AUTH_RE = re.compile(r"not logged in|log ?in|unauthori[sz]ed|401|token (expired|invalid)|auth", re.IGNORECASE)
 
-    def _run_cli_process(self, cmd, env, creationflags, out_file) -> Tuple[bool, str, str]:
-        """Runs a CLI once. Returns (ok, text_or_error, kind) with kind in ok/quota/auth/other."""
+    def _run_cli_process(self, cmd, env, creationflags, out_file, stdin_text=None) -> Tuple[bool, str, str]:
+        """Runs a CLI once. Returns (ok, text_or_error, kind) with kind in ok/quota/model/auth/other."""
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1019,6 +1058,12 @@ class AgentWorker(QThread):
                 bufsize=1,
                 env=env,
             )
+            if stdin_text is not None and proc.stdin:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except OSError:
+                    pass
             collected: List[str] = []
             if proc.stdout:
                 for line in iter(proc.stdout.readline, ""):
@@ -1056,6 +1101,11 @@ class AgentWorker(QThread):
             detail = err_text[-300:] or f"종료 코드 {proc.returncode}"
             if self._QUOTA_RE.search(err_text):
                 return False, "구독 토큰/사용량 한도 소진 (Quota/Rate Limit Exceeded)", "quota"
+            if re.search(r"model_not_found|model is not supported", err_text, re.IGNORECASE):
+                return False, (
+                    "이 계정에서 지원하지 않는 모델입니다. 터미널의 codex 설정(~/.codex/config.toml)의 model 값이 "
+                    "계정에서 쓸 수 없는 모델입니다. 지원되는 모델로 바꾸거나 다른 AI 모델을 선택해 주세요."
+                ), "model"
             if self._AUTH_RE.search(err_text):
                 return False, f"로그인 필요/인증 오류: {detail[:140]}", "auth"
             return False, detail[:200], "other"

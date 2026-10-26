@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 
 from storage import StorageManager
 from theme import get_palette
@@ -649,6 +649,26 @@ class SettingsWorkspaceDialog(QDialog):
     def _trigger_codex_login(self, home: str):
         ok, msg = launch_codex_account_login(home)
         (QMessageBox.information if ok else QMessageBox.warning)(self, "Codex 로그인", msg)
+        if ok:
+            self._watch_codex_logins()
+
+    def _watch_codex_logins(self):
+        """Re-renders the account cards once a background `codex login` finishes (polls up to 5 minutes)."""
+        snapshot = lambda: tuple((a["id"], a["logged_in"]) for a in get_codex_accounts())
+        before = snapshot()
+        timer = QTimer(self)
+        ticks = {"n": 0}
+
+        def poll():
+            ticks["n"] += 1
+            if snapshot() != before:
+                timer.stop()
+                self._render_subscription_cards()
+            elif ticks["n"] >= 150:
+                timer.stop()
+
+        timer.timeout.connect(poll)
+        timer.start(2000)
 
     def _add_codex_account(self):
         acc = create_codex_account()
