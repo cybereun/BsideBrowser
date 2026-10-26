@@ -124,57 +124,103 @@ class CheckUpdateThread(QThread):
 
 
 class DownloadUpdateThread(QThread):
+    """
+    Downloads the installer with automatic retry + resume (HTTP Range). A connection that is reset mid-way
+    (flaky network, proxy or security software closing the socket) continues from the bytes already saved.
+    """
     progress = Signal(int, int, int)  # percent, downloaded, total
+    retrying = Signal(str)            # human readable retry notice
     finished = Signal(str)            # local file path
     failed = Signal(str)
 
-    def __init__(self, url: str, asset_name: str, parent=None):
+    MAX_ATTEMPTS = 8
+
+    def __init__(self, url: str, asset_name: str, parent=None, expected_size: int = 0):
         super().__init__(parent)
         self.url = url
         self.asset_name = asset_name
+        self.expected_size = int(expected_size or 0)
         self._is_cancelled = False
 
     def cancel(self):
         self._is_cancelled = True
 
+    def _discard(self, *paths):
+        for pth in paths:
+            try:
+                if os.path.exists(pth):
+                    os.remove(pth)
+            except OSError:
+                pass
+
     def run(self):
-        try:
-            temp_dir = tempfile.gettempdir()
-            filename = self.asset_name if self.asset_name else "Bside_Setup_Update.exe"
-            target_path = os.path.join(temp_dir, filename)
+        filename = self.asset_name if self.asset_name else "Bside_Setup_Update.exe"
+        target_path = os.path.join(tempfile.gettempdir(), filename)
+        part_path = target_path + ".part"
+        self._discard(part_path)  # never resume a leftover from an older run
+        last_err = ""
 
-            req = urllib.request.Request(
-                self.url,
-                headers={"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"},
-            )
-
-            with urllib.request.urlopen(req, timeout=30) as resp, open(target_path, "wb") as out_file:
-                total_size = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                block_size = 65536
-
-                while not self._is_cancelled:
-                    chunk = resp.read(block_size)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        pct = int((downloaded / total_size) * 100)
-                        self.progress.emit(pct, downloaded, total_size)
-
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
             if self._is_cancelled:
-                if os.path.exists(target_path):
-                    try:
-                        os.remove(target_path)
-                    except Exception:
-                        pass
-                self.failed.emit("다운로드가 취소되었습니다.")
-                return
+                break
+            have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+            if self.expected_size and have >= self.expected_size:
+                break
+            try:
+                headers = {"User-Agent": f"{APP_NAME}-Updater/{APP_VERSION}"}
+                if have:
+                    headers["Range"] = f"bytes={have}-"
+                req = urllib.request.Request(self.url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resumed = bool(have) and resp.status == 206
+                    if have and not resumed:
+                        have = 0  # server ignored Range: start over
+                    length = int(resp.headers.get("Content-Length", 0))
+                    total = self.expected_size or (length + have)
+                    downloaded = have
+                    with open(part_path, "ab" if resumed else "wb") as out_file:
+                        while not self._is_cancelled:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            out_file.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                self.progress.emit(int(downloaded / total * 100), downloaded, total)
+                if self._is_cancelled:
+                    break
+                size_now = os.path.getsize(part_path)
+                if not self.expected_size or size_now >= self.expected_size:
+                    break  # complete
+                last_err = f"전송이 중간에 끊겼습니다 ({size_now}/{self.expected_size} bytes)"
+            except urllib.error.HTTPError as e:
+                if e.code == 416:  # range past the end: the file is already complete
+                    break
+                last_err = f"HTTP {e.code}"
+            except Exception as e:  # reset / timeout / DNS: retry and resume
+                last_err = str(e)
 
-            self.finished.emit(target_path)
-        except Exception as e:
-            self.failed.emit(f"다운로드 실패: {str(e)}")
+            if attempt < self.MAX_ATTEMPTS and not self._is_cancelled:
+                self.retrying.emit(f"연결이 끊겨 이어받는 중... ({attempt}/{self.MAX_ATTEMPTS - 1}회 재시도) — {last_err[:60]}")
+                self.msleep(min(2000 * attempt, 8000))
+
+        if self._is_cancelled:
+            self._discard(part_path)
+            self.failed.emit("다운로드가 취소되었습니다.")
+            return
+
+        size_now = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        if size_now == 0 or (self.expected_size and size_now < self.expected_size):
+            self._discard(part_path)
+            self.failed.emit(f"다운로드 실패: {last_err or '연결할 수 없습니다'}")
+            return
+
+        try:
+            os.replace(part_path, target_path)
+        except OSError as e:
+            self.failed.emit(f"다운로드 파일 저장 실패: {e}")
+            return
+        self.finished.emit(target_path)
 
 
 def launch_silent_installer_and_restart(installer_path: str):
@@ -222,7 +268,7 @@ class UpdateDialog(QDialog):
         self.download_thread = None
 
         self.setWindowTitle(f"{APP_NAME} 자동 업데이트 ({update_info.get('tag_name', '')})")
-        self.setFixedSize(500, 380)
+        self.setFixedSize(500, 400)
 
         asset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
         icon_path = os.path.join(asset_dir, "app_icon.ico")
@@ -312,6 +358,7 @@ class UpdateDialog(QDialog):
         layout.addWidget(self.status_lbl)
 
         btn_layout = QHBoxLayout()
+        self.btn_row = btn_layout
         btn_layout.addStretch()
 
         self.btn_later = QPushButton("취소 / 나중에")
@@ -350,8 +397,11 @@ class UpdateDialog(QDialog):
         self.status_lbl.setText("업데이트 설치 파일 다운로드 중...")
 
         asset_name = self.update_info.get("asset_name", "Bside_Setup_Update.exe")
-        self.download_thread = DownloadUpdateThread(download_url, asset_name, self)
+        self.download_thread = DownloadUpdateThread(
+            download_url, asset_name, self, expected_size=int(self.update_info.get("asset_size") or 0)
+        )
         self.download_thread.progress.connect(self._on_progress)
+        self.download_thread.retrying.connect(self.status_lbl.setText)
         self.download_thread.finished.connect(self._on_finished)
         self.download_thread.failed.connect(self._on_failed)
         self.download_thread.start()
@@ -373,7 +423,19 @@ class UpdateDialog(QDialog):
     def _on_failed(self, err_msg):
         self.btn_update.setEnabled(True)
         self.btn_update.setText("재시도")
-        self.status_lbl.setText(f"오류: {err_msg}")
+        self.status_lbl.setText(
+            f"오류: {err_msg}\n보안 프로그램이나 네트워크가 다운로드를 막고 있다면 '브라우저로 직접 받기'를 이용하세요."
+        )
+        self.status_lbl.setWordWrap(True)
+        if not getattr(self, "btn_browser", None):
+            self.btn_browser = QPushButton("브라우저로 직접 받기")
+            self.btn_browser.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_browser.clicked.connect(self._open_release_page)
+            self.btn_row.insertWidget(1, self.btn_browser)
+
+    def _open_release_page(self):
+        import webbrowser
+        webbrowser.open(self.update_info.get("html_url") or self.update_info.get("download_url") or "")
 
 
 class AutoUpdater:
