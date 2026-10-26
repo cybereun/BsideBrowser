@@ -11,6 +11,7 @@ Replicates:
    - Tab 4: ⚡ 자동화 루틴 (Routines)
 """
 
+import os
 from typing import List, Dict, Any
 from PySide6.QtWidgets import (
     QDialog,
@@ -34,7 +35,13 @@ from PySide6.QtCore import Qt, Signal
 
 from storage import StorageManager
 from theme import get_palette
-from agent_engine import get_subscription_auth_status, launch_subscription_login_terminal
+from agent_engine import (
+    create_codex_account,
+    get_codex_accounts,
+    get_subscription_auth_status,
+    launch_codex_account_login,
+    launch_subscription_login_terminal,
+)
 
 
 class TabSearchDialog(QDialog):
@@ -567,8 +574,22 @@ class SettingsWorkspaceDialog(QDialog):
         p = get_palette(self.storage.get_setting("theme", "dark"))
         status_map = get_subscription_auth_status()
 
+        # One card per entry; Codex gets one card per ChatGPT account (each has its own login folder).
+        entries = []
         for key in ("antigravity", "claude", "codex"):
-            info = status_map.get(key, {})
+            info = dict(status_map.get(key, {}))
+            if key != "codex":
+                entries.append((key, info, None))
+                continue
+            active = self.storage.get_setting("codex_active_account", "default")
+            for acc in get_codex_accounts(active):
+                acc_info = dict(info)
+                acc_info["name"] = f"Codex 구독 — {acc['label']}" + ("  ⭐ 우선 사용" if acc["id"] == active else "")
+                acc_info["logged_in"] = acc["logged_in"]
+                acc_info["cred_path"] = os.path.join(acc["home"], "auth.json")
+                entries.append((f"codex_{acc['id']}", acc_info, acc))
+
+        for key, info, codex_acc in entries:
             card = QFrame()
             card.setObjectName(f"SubCard_{key}")
             card.setStyleSheet(
@@ -602,10 +623,41 @@ class SettingsWorkspaceDialog(QDialog):
             login_btn.setStyleSheet(
                 f"background-color: {p['bg_elevated']}; color: {p['fg']}; border: 1px solid {p['border_strong']}; border-radius: 7px; padding: 6px 12px; font-weight: 600; font-size: 11.5px;"
             )
-            login_btn.clicked.connect(lambda checked=False, prov=key: self._trigger_cli_login(prov))
+            if codex_acc is None:
+                login_btn.clicked.connect(lambda checked=False, prov=key: self._trigger_cli_login(prov))
+            else:
+                login_btn.clicked.connect(lambda checked=False, a=codex_acc: self._trigger_codex_login(a["home"]))
             row.addWidget(login_btn)
 
+            if codex_acc is not None and codex_acc["logged_in"]:
+                pref_btn = QPushButton("⭐ 우선 사용")
+                pref_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                pref_btn.setStyleSheet(login_btn.styleSheet())
+                pref_btn.clicked.connect(lambda checked=False, a=codex_acc: self._set_codex_active(a["id"]))
+                row.addWidget(pref_btn)
+
             self.sub_cards_container.addWidget(card)
+
+        add_btn = QPushButton("➕ Codex 계정 추가 (ChatGPT 계정 여러 개 연결)")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setStyleSheet(
+            f"background-color: {p['bg_elevated']}; color: {p['accent']}; border: 1px dashed {p['border_strong']}; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+        )
+        add_btn.clicked.connect(self._add_codex_account)
+        self.sub_cards_container.addWidget(add_btn)
+
+    def _trigger_codex_login(self, home: str):
+        ok, msg = launch_codex_account_login(home)
+        (QMessageBox.information if ok else QMessageBox.warning)(self, "Codex 로그인", msg)
+
+    def _add_codex_account(self):
+        acc = create_codex_account()
+        self._trigger_codex_login(acc["home"])
+        self._render_subscription_cards()
+
+    def _set_codex_active(self, account_id: str):
+        self.storage.set_setting("codex_active_account", account_id)
+        self._render_subscription_cards()
 
     def _trigger_cli_login(self, provider: str):
         ok, msg = launch_subscription_login_terminal(provider)

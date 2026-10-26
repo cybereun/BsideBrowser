@@ -27,8 +27,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QToolTip,
 )
-from PySide6.QtCore import Qt, QUrl, Signal, QSize, QEvent, QObject
-from PySide6.QtGui import QShortcut, QKeySequence, QCursor
+from PySide6.QtCore import Qt, QUrl, Signal, QSize, QEvent, QObject, QTimer
+from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QKeyEvent
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile
 
@@ -38,7 +38,10 @@ from internal_pages import NewTabWidget, WorkspaceWidget
 from sidepanel import BsideAgentSidepanel
 from icons import make_nav_icon, make_3d_badge_pixmap, get_internal_title_icon_pixmap
 from agent_engine import (
+    AGENT_SNAPSHOT_JS,
     BSIDEWRIGHT_SNAPSHOT_JS,
+    AutonomousAgentWorker,
+    PageBridge,
     build_bsidewright_action_js,
     build_vault_login_autofill_js,
     build_vault_card_autofill_js,
@@ -458,6 +461,7 @@ class MainWindow(QMainWindow):
         self.sidepanel.prompt_submitted.connect(self.run_agent_prompt)
         self.sidepanel.quick_action_triggered.connect(lambda pr: self.run_agent_prompt(pr))
         self.sidepanel.remote_action_triggered.connect(self._execute_bsidewright_action)
+        self.sidepanel.remote_stop_triggered.connect(self._stop_remote_agent)
         self.sidepanel.open_settings_requested.connect(self.open_settings_dialog)
         self.sidepanel.open_vault_requested.connect(self.open_vault_dialog)
         self.splitter.addWidget(self.sidepanel)
@@ -952,6 +956,11 @@ class MainWindow(QMainWindow):
         if not prompt.strip():
             return
 
+        worker = getattr(self, "active_worker", None)
+        if isinstance(worker, AutonomousAgentWorker) and worker.isRunning():
+            self.sidepanel.set_agent_status("⏳ 원격조정 작업 진행 중 — ⏹ 중지 후 다시 요청해 주세요", busy=True)
+            return
+
         cur = self.current_tab()
         on_newtab = bool(cur and cur.logical_url == "bside://newtab")
         sidepanel_open = self.sidepanel.isVisible()
@@ -990,6 +999,10 @@ class MainWindow(QMainWindow):
             self._target_newtab_widget.start_inline_turn(user_msg)
             self._target_newtab_widget.set_inline_status("✦ AI 응답 생성 중...", busy=True)
 
+        if self.sidepanel.is_remote_mode():
+            self._start_agent_worker(full_prompt, {}, autonomous=True)
+            return
+
         if not cur or cur.logical_url.startswith("bside://"):
             self._start_agent_worker(
                 full_prompt,
@@ -1010,11 +1023,11 @@ class MainWindow(QMainWindow):
 
         cur.webview.page().runJavaScript(BSIDEWRIGHT_SNAPSHOT_JS, on_dom_snapshot)
 
-    def _start_agent_worker(self, prompt: str, snapshot: Dict[str, Any]):
+    def _start_agent_worker(self, prompt: str, snapshot: Dict[str, Any], autonomous: bool = False):
         open_tabs = [{"title": t.logical_title, "url": t.logical_url} for t in self.tabs]
         sess = self.storage.get_active_session()
 
-        self.active_worker = AgentWorker(
+        kwargs = dict(
             prompt=prompt,
             page_snapshot=snapshot,
             open_tabs=open_tabs,
@@ -1023,6 +1036,12 @@ class MainWindow(QMainWindow):
             settings=self.storage.data.get("settings", {}),
             conversation_messages=sess.get("messages", []),
         )
+        if autonomous:
+            if not hasattr(self, "_page_bridge"):
+                self._page_bridge = PageBridge(self._handle_bridge_request, self)
+            self.active_worker = AutonomousAgentWorker(bridge=self._page_bridge, **kwargs)
+        else:
+            self.active_worker = AgentWorker(**kwargs)
         self.active_worker.step_emitted.connect(self._on_worker_step)
         self.active_worker.chunk_emitted.connect(self._on_worker_chunk)
         self.active_worker.action_requested.connect(self._execute_bsidewright_action)
@@ -1066,6 +1085,51 @@ class MainWindow(QMainWindow):
             cards = self.storage.get_card_entries()
             if cards:
                 self._autofill_vault_card(cards[0])
+
+    def _stop_remote_agent(self):
+        worker = getattr(self, "active_worker", None)
+        if isinstance(worker, AutonomousAgentWorker) and worker.isRunning():
+            worker.stop()
+            self.sidepanel.set_agent_status("⏹ 원격조정 중지 중...", busy=True)
+
+    def _handle_bridge_request(self, op: str, payload: Dict[str, Any], reply):
+        """Runs on the GUI thread on behalf of AutonomousAgentWorker; `reply` hands the result back."""
+        if op == "confirm":
+            ans = QMessageBox.question(self, "원격조정 확인", payload.get("text", "계속할까요?"))
+            reply({"ok": ans == QMessageBox.StandardButton.Yes})
+            return
+
+        cur = self.current_tab()
+        if not cur:
+            reply({"ok": False, "error": "열린 탭이 없습니다"})
+            return
+
+        if op == "snapshot":
+            cur.webview.page().runJavaScript(
+                AGENT_SNAPSHOT_JS,
+                lambda r: reply({"ok": isinstance(r, dict), "snapshot": r}),
+            )
+        elif op == "press_enter":
+            cur.webview.setFocus()
+            target = cur.webview.focusProxy() or cur.webview
+            for etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+                QApplication.sendEvent(
+                    target,
+                    QKeyEvent(etype, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier, "\r"),
+                )
+            QTimer.singleShot(2000, lambda: reply({"ok": True}))
+        elif op == "act":
+            if payload.get("action") == "navigate":
+                cur.navigate(payload.get("url", ""))
+                QTimer.singleShot(3500, lambda: reply({"ok": True}))
+            else:
+                # Give the page time to react (SPA updates / navigation) before the next observation.
+                cur.webview.page().runJavaScript(
+                    build_bsidewright_action_js(payload),
+                    lambda r: QTimer.singleShot(1500, lambda: reply({"ok": True, "result": str(r)})),
+                )
+        else:
+            reply({"ok": False, "error": f"unknown op {op}"})
 
     def _on_agent_finished(self, result: Dict[str, Any]):
         sess = self.storage.get_active_session()

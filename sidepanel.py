@@ -617,6 +617,7 @@ class BsideAgentSidepanel(QWidget):
     prompt_submitted = Signal(str, list)          # (prompt_text, attachments)
     quick_action_triggered = Signal(str)          # prompt_text
     remote_action_triggered = Signal(dict)        # direct Bsidewright action dict
+    remote_stop_triggered = Signal()              # stop the running autonomous remote-control task
     open_settings_requested = Signal()
     open_vault_requested = Signal()
 
@@ -742,7 +743,9 @@ class BsideAgentSidepanel(QWidget):
         self.remote_toggle_btn.setCheckable(True)
         self.remote_toggle_btn.setChecked(False)
         self.remote_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.remote_toggle_btn.setToolTip("이 웹페이지를 AI로 분석·작성·원격 제어하는 도구 모음 열기")
+        self.remote_toggle_btn.setToolTip(
+            "원격조정 모드 켜기/끄기 — 켜면 AI가 직접 페이지를 보고 이동·검색·클릭하며 목표를 달성하고 결과를 알려줍니다"
+        )
         self.remote_toggle_btn.toggled.connect(self._toggle_remote_bar)
         chip_layout.addWidget(self.remote_toggle_btn)
 
@@ -760,6 +763,7 @@ class BsideAgentSidepanel(QWidget):
             ("✍️ 입력란 작성", self._prompt_remote_write),
             ("🎯 요소 표시", lambda: self.remote_action_triggered.emit({"action": "highlight", "target": "all"})),
             ("⏬ 스크롤", lambda: self.remote_action_triggered.emit({"action": "scroll", "value": "down"})),
+            ("⏹ 중지", lambda: self.remote_stop_triggered.emit()),
         ]
         self.remote_btns.clear()
         for label, handler in remote_actions:
@@ -1019,8 +1023,17 @@ class BsideAgentSidepanel(QWidget):
         else:
             self.quick_action_triggered.emit(cmd)
 
+    def is_remote_mode(self) -> bool:
+        return self.remote_toggle_btn.isChecked()
+
     def _toggle_remote_bar(self, checked: bool):
         self.remote_bar.setVisible(checked)
+        self.remote_toggle_btn.setText("🕹️ 원격조정 ON" if checked else "🕹️ 원격조정")
+        self.composer_input.setPlaceholderText(
+            "원격조정 ON — 할 일을 말하면 AI가 직접 검색·클릭하고 결과를 알려줍니다"
+            if checked
+            else "Ask AI a task, @ for context (이 페이지 분석·작성·원격 제어)"
+        )
 
     def _prompt_remote_write(self):
         self.composer_input.setPlainText("현재 페이지 입력란에 '' 내용을 작성해줘")
