@@ -981,16 +981,25 @@ class AgentWorker(QThread):
                 cli_effort,
             ]
         elif provider == "codex":
-            codex_out_file = os.path.join(tempfile.gettempdir(), f"bside_codex_{os.getpid()}_{int(time.time() * 1000)}.txt")
+            # "GPT-6 Luna" -> "gpt-6-luna" (the config.toml model is no longer read, so pass it explicitly)
+            codex_model = str(self.settings.get("codex_model") or "").strip()
+            if not codex_model and (model_variant or "").lower().startswith("gpt"):
+                codex_model = re.sub(r"\s+", "-", model_variant.strip().lower())
             cmd = [
                 bin_path,
                 "exec",
                 "--skip-git-repo-check",
-                "-o",
-                codex_out_file,
+                # Plain text completion: skip ~/.codex/config.toml (plugins, hooks, xhigh effort) and tool use,
+                # which made a single reply take minutes instead of seconds.
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "-s",
+                "read-only",
+                "--json",  # event stream: `-o` keeps only the LAST message, which can be empty
                 "-c",
                 f'model_reasoning_effort="{cli_effort}"',
-                *(["-m", str(self.settings["codex_model"])] if self.settings.get("codex_model") else []),
+                *(["-m", codex_model] if codex_model else []),
                 "-",
             ]
         elif provider == "antigravity":
@@ -1023,7 +1032,7 @@ class AgentWorker(QThread):
             last_err = ""
             for acc in accounts:
                 env = dict(os.environ, CODEX_HOME=acc["home"])
-                ok, out, kind = self._run_cli_process(cmd, env, creationflags, codex_out_file, stdin_text)
+                ok, out, kind = self._run_cli_process(cmd, env, creationflags, True, stdin_text)
                 if ok:
                     set_preferred_codex_account(acc["id"])
                     return True, out
@@ -1033,6 +1042,8 @@ class AgentWorker(QThread):
             return False, last_err
         ok, out, _ = self._run_cli_process(cmd, None, creationflags, None, stdin_text)
         return ok, out
+
+    CLI_TIMEOUT_SEC = 120.0
 
     # A real quota/rate-limit failure prints these on stderr with a non-zero exit code.
     _QUOTA_RE = re.compile(
@@ -1058,12 +1069,31 @@ class AgentWorker(QThread):
                 bufsize=1,
                 env=env,
             )
+            self._current_proc = proc
+            timed_out = {"v": False}
+
+            def _kill_stuck() -> None:
+                timed_out["v"] = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            watchdog = threading.Timer(self.CLI_TIMEOUT_SEC, _kill_stuck)
+            watchdog.daemon = True
+            watchdog.start()
             if stdin_text is not None and proc.stdin:
                 try:
                     proc.stdin.write(stdin_text)
                     proc.stdin.close()
                 except OSError:
                     pass
+            # Drain stderr while stdout is read: a CLI that logs a lot blocks once the pipe buffer is full.
+            err_chunks: List[str] = []
+            err_thread = threading.Thread(
+                target=lambda: err_chunks.append(proc.stderr.read() if proc.stderr else ""), daemon=True
+            )
+            err_thread.start()
             collected: List[str] = []
             if proc.stdout:
                 for line in iter(proc.stdout.readline, ""):
@@ -1072,26 +1102,35 @@ class AgentWorker(QThread):
                     if line.startswith("Reading additional input from stdin"):
                         continue
                     collected.append(line)
-                    if not out_file:  # codex stdout is banner/prompt echo; its clean answer goes to out_file
+                    if not out_file:  # codex stdout is a JSON event stream, not text for the chat card
                         partial = "".join(collected).strip()
                         if partial:
                             self._emit_chunk(partial)
 
-            proc.wait(timeout=45)
+            proc.wait(timeout=30)
+            watchdog.cancel()
+            self._current_proc = None
+            if timed_out["v"]:
+                return False, f"구독 CLI 응답 시간 초과 ({int(self.CLI_TIMEOUT_SEC)}초)", "other"
+            if getattr(self, "_stop_requested", False):
+                return False, "사용자가 중지했습니다", "other"
             stdout = "".join(collected).strip()
-            stderr = (proc.stderr.read() if proc.stderr else "").strip()
+            err_thread.join(timeout=5)
+            stderr = "".join(err_chunks).strip()
 
-            if out_file:
-                try:
-                    with open(out_file, encoding="utf-8", errors="replace") as f:
-                        stdout = f.read().strip()
-                except OSError:
-                    stdout = ""
-                finally:
+            if out_file:  # codex --json: the reply is the last non-empty agent_message event
+                reply = ""
+                for line in stdout.splitlines():
                     try:
-                        os.remove(out_file)
-                    except OSError:
-                        pass
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    item = ev.get("item") or {}
+                    if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+                        text = (item.get("text") or "").strip()
+                        if text:
+                            reply = text
+                stdout = reply
 
             if proc.returncode == 0 and stdout:
                 return True, stdout, "ok"
@@ -1379,6 +1418,12 @@ class AutonomousAgentWorker(AgentWorker):
 
     def stop(self) -> None:
         self._stop_requested = True
+        proc = getattr(self, "_current_proc", None)
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     # The base class' model callers use these two hooks; the loop swaps `self.prompt` for each turn.
     def _build_system_context(self) -> str:
@@ -1489,6 +1534,11 @@ class AutonomousAgentWorker(AgentWorker):
                 emit_step("페이지를 읽지 못했습니다")
                 break
 
+            self.chunk_emitted.emit(
+                "🕹️ **원격조정 진행 중**\n\n"
+                + "\n".join(f"- {st['summary']}" for st in steps)
+                + f"\n- ⏳ {n}단계: 화면을 보고 다음 행동을 판단하는 중..."
+            )
             raw = self._ask_model(self._turn_prompt(goal, snap, log))
             act = self._parse_decision(raw or "")
             if act is None:
